@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: instagram-api
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 2 --threads 4 --timeout 120
+    envVars:
+      - key: INSTAGRAM_LOGIN_USER
+        sync: false
+      - key: INSTAGRAM_SESSION_FILE_B64
+        sync: false
+      - key: INSTAGRAM_SESSION_FILE
+        value: /tmp/instagram.session
+      - key: IMAGE_CACHE_DIR
+        value: /tmp/instagram-pfp-cache
