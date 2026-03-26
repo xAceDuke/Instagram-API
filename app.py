@@ -15,6 +15,7 @@ from instaloader.exceptions import (
     BadCredentialsException,
     ConnectionException,
     ProfileNotExistsException,
+    TooManyRequestsException,
     TwoFactorAuthRequiredException,
 )
 
@@ -28,6 +29,10 @@ profile_cache: dict[str, dict] = {}
 
 
 class InstagramSessionError(RuntimeError):
+    pass
+
+
+class InstagramRateLimitError(RuntimeError):
     pass
 
 
@@ -129,13 +134,22 @@ def _fetch_pfp(username: str) -> dict:
         save_metadata=False,
         compress_json=False,
     )
+    loader.context.max_connection_attempts = 1
     _load_instaloader_session(loader)
 
     try:
         profile = Profile.from_username(loader.context, normalized)
     except ProfileNotExistsException as exc:
         raise ValueError(f"Instagram username does not exist: {normalized}") from exc
+    except TooManyRequestsException as exc:
+        raise InstagramRateLimitError(
+            "Instagram rate limit reached (429). Please retry after some time."
+        ) from exc
     except ConnectionException as exc:
+        if "429" in str(exc):
+            raise InstagramRateLimitError(
+                "Instagram rate limit reached (429). Please retry after some time."
+            ) from exc
         raise RuntimeError("Instagram connection failed while fetching profile.") from exc
 
     ext = _file_extension_from_url(profile.profile_pic_url)
@@ -170,6 +184,11 @@ def health() -> tuple:
     return jsonify({"ok": True, "cache_ttl_seconds": CACHE_TTL_SECONDS}), 200
 
 
+@app.get("/")
+def index() -> tuple:
+    return jsonify({"ok": True, "message": "Instagram API is running."}), 200
+
+
 @app.get("/api/pfp/<username>")
 def get_profile_pic(username: str):
     if not username.strip():
@@ -187,6 +206,8 @@ def get_profile_pic(username: str):
         return response
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 404
+    except InstagramRateLimitError as exc:
+        return jsonify({"error": str(exc)}), 429
     except InstagramSessionError as exc:
         return jsonify({"error": str(exc)}), 500
     except Exception:
