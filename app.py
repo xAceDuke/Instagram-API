@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 from urllib.request import urlopen
 
 from flask import Flask, Response, jsonify, send_file
-from instaloader import Instaloader, Profile
+from instaloader import Instaloader, Profile, RateController
 from instaloader.exceptions import (
     BadCredentialsException,
     ConnectionException,
@@ -21,11 +21,17 @@ from instaloader.exceptions import (
 
 CACHE_TTL_SECONDS = 3 * 60 * 60
 IMAGE_CACHE_DIR = Path(os.getenv("IMAGE_CACHE_DIR", "/tmp/instagram-pfp-cache"))
+RATE_LIMIT_COOLDOWN_SECONDS = int(
+    os.getenv("INSTAGRAM_RATE_LIMIT_COOLDOWN_SECONDS", "1800")
+)
+MAX_RATE_SLEEP_SECONDS = float(os.getenv("INSTAGRAM_MAX_RATE_SLEEP_SECONDS", "1"))
 
 app = Flask(__name__)
 
 cache_lock = threading.Lock()
+fetch_lock = threading.Lock()
 profile_cache: dict[str, dict] = {}
+rate_limit_until_epoch = 0.0
 
 
 class InstagramSessionError(RuntimeError):
@@ -33,7 +39,35 @@ class InstagramSessionError(RuntimeError):
 
 
 class InstagramRateLimitError(RuntimeError):
-    pass
+    def __init__(self, message: str, retry_after_seconds: int | None = None):
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
+class ApiRateController(RateController):
+    def sleep(self, secs: float):
+        if secs > MAX_RATE_SLEEP_SECONDS:
+            raise InstagramRateLimitError(
+                "Instagram rate limit reached. Please retry later.",
+                retry_after_seconds=max(int(secs), RATE_LIMIT_COOLDOWN_SECONDS),
+            )
+        if secs > 0:
+            time.sleep(secs)
+
+
+def _raise_if_rate_limited(now_epoch: float) -> None:
+    if rate_limit_until_epoch <= now_epoch:
+        return
+    retry_after = int(rate_limit_until_epoch - now_epoch)
+    raise InstagramRateLimitError(
+        "Instagram rate limit cooldown is active. Please retry later.",
+        retry_after_seconds=max(retry_after, 1),
+    )
+
+
+def _set_rate_limit_cooldown(now_epoch: float, seconds: int) -> None:
+    global rate_limit_until_epoch
+    rate_limit_until_epoch = max(rate_limit_until_epoch, now_epoch + seconds)
 
 
 def _iso_utc(epoch_seconds: float) -> str:
@@ -110,6 +144,7 @@ def _load_instaloader_session(loader: Instaloader) -> None:
 def _fetch_pfp(username: str) -> dict:
     normalized = username.strip().lower()
     now = time.time()
+    _raise_if_rate_limited(now)
 
     with cache_lock:
         existing = profile_cache.get(normalized)
@@ -126,38 +161,62 @@ def _fetch_pfp(username: str) -> dict:
                 "expires_at": _iso_utc(existing["expires_at_epoch"]),
             }
 
-    loader = Instaloader(
-        quiet=True,
-        download_pictures=False,
-        download_videos=False,
-        download_video_thumbnails=False,
-        save_metadata=False,
-        compress_json=False,
-    )
-    loader.context.max_connection_attempts = 1
-    _load_instaloader_session(loader)
+    with fetch_lock:
+        now = time.time()
+        _raise_if_rate_limited(now)
 
-    try:
-        profile = Profile.from_username(loader.context, normalized)
-    except ProfileNotExistsException as exc:
-        raise ValueError(f"Instagram username does not exist: {normalized}") from exc
-    except TooManyRequestsException as exc:
-        raise InstagramRateLimitError(
-            "Instagram rate limit reached (429). Please retry after some time."
-        ) from exc
-    except ConnectionException as exc:
-        if "429" in str(exc):
+        with cache_lock:
+            existing = profile_cache.get(normalized)
+            if (
+                existing
+                and existing["expires_at_epoch"] > now
+                and Path(existing["local_path"]).exists()
+            ):
+                return {
+                    "username": normalized,
+                    "local_path": existing["local_path"],
+                    "content_type": existing["content_type"],
+                    "cached": True,
+                    "expires_at": _iso_utc(existing["expires_at_epoch"]),
+                }
+
+        loader = Instaloader(
+            quiet=True,
+            download_pictures=False,
+            download_videos=False,
+            download_video_thumbnails=False,
+            save_metadata=False,
+            compress_json=False,
+            rate_controller=lambda ctx: ApiRateController(ctx),
+        )
+        loader.context.max_connection_attempts = 1
+        _load_instaloader_session(loader)
+
+        try:
+            profile = Profile.from_username(loader.context, normalized)
+        except ProfileNotExistsException as exc:
+            raise ValueError(f"Instagram username does not exist: {normalized}") from exc
+        except TooManyRequestsException as exc:
+            _set_rate_limit_cooldown(time.time(), RATE_LIMIT_COOLDOWN_SECONDS)
             raise InstagramRateLimitError(
-                "Instagram rate limit reached (429). Please retry after some time."
+                "Instagram rate limit reached (429). Please retry after some time.",
+                retry_after_seconds=RATE_LIMIT_COOLDOWN_SECONDS,
             ) from exc
-        raise RuntimeError("Instagram connection failed while fetching profile.") from exc
+        except ConnectionException as exc:
+            if "429" in str(exc):
+                _set_rate_limit_cooldown(time.time(), RATE_LIMIT_COOLDOWN_SECONDS)
+                raise InstagramRateLimitError(
+                    "Instagram rate limit reached (429). Please retry after some time.",
+                    retry_after_seconds=RATE_LIMIT_COOLDOWN_SECONDS,
+                ) from exc
+            raise RuntimeError("Instagram connection failed while fetching profile.") from exc
 
-    ext = _file_extension_from_url(profile.profile_pic_url)
-    local_path = IMAGE_CACHE_DIR / f"{normalized}{ext}"
-    try:
-        _download_image(profile.profile_pic_url, local_path)
-    except URLError as exc:
-        raise RuntimeError("Failed to download profile image from Instagram.") from exc
+        ext = _file_extension_from_url(profile.profile_pic_url)
+        local_path = IMAGE_CACHE_DIR / f"{normalized}{ext}"
+        try:
+            _download_image(profile.profile_pic_url, local_path)
+        except URLError as exc:
+            raise RuntimeError("Failed to download profile image from Instagram.") from exc
 
     content_type = _content_type_for_path(local_path)
     expires = now + CACHE_TTL_SECONDS
@@ -181,7 +240,19 @@ def _fetch_pfp(username: str) -> dict:
 
 @app.get("/health")
 def health() -> tuple:
-    return jsonify({"ok": True, "cache_ttl_seconds": CACHE_TTL_SECONDS}), 200
+    now = time.time()
+    retry_after = max(int(rate_limit_until_epoch - now), 0)
+    return (
+        jsonify(
+            {
+                "ok": True,
+                "cache_ttl_seconds": CACHE_TTL_SECONDS,
+                "rate_limit_cooldown_active": retry_after > 0,
+                "retry_after_seconds": retry_after,
+            }
+        ),
+        200,
+    )
 
 
 @app.get("/")
@@ -207,7 +278,13 @@ def get_profile_pic(username: str):
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 404
     except InstagramRateLimitError as exc:
-        return jsonify({"error": str(exc)}), 429
+        body = {"error": str(exc)}
+        if exc.retry_after_seconds:
+            body["retry_after_seconds"] = exc.retry_after_seconds
+        response = jsonify(body)
+        if exc.retry_after_seconds:
+            response.headers["Retry-After"] = str(exc.retry_after_seconds)
+        return response, 429
     except InstagramSessionError as exc:
         return jsonify({"error": str(exc)}), 500
     except Exception:
