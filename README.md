@@ -97,7 +97,7 @@ Windows PowerShell:
 	- **Environment**: `Python 3`
 	- **Instance Type**: `Free`
 	- **Build Command**: `pip install -r requirements.txt`
-	- **Start Command**: `gunicorn app:app --workers 2 --threads 4 --timeout 120`
+	- **Start Command**: `gunicorn app:app --workers 1 --threads 4 --timeout 120`
 5. Click **Create Web Service** and wait for the first deploy to finish.
 
 ### 4) Set environment variables in Render Dashboard
