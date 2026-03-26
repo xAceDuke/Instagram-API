@@ -1,13 +1,15 @@
 import base64
+import html
 import mimetypes
 import os
+import re
 import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 from flask import Flask, Response, jsonify, send_file
 from instaloader import Instaloader, Profile, RateController
@@ -83,6 +85,36 @@ def _download_image(url: str, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     with urlopen(url, timeout=30) as response:
         destination.write_bytes(response.read())
+
+
+def _fetch_public_profile_pic_url(username: str) -> str | None:
+    request = Request(
+        f"https://www.instagram.com/{username}/",
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    )
+
+    try:
+        with urlopen(request, timeout=20) as response:
+            page = response.read().decode("utf-8", errors="ignore")
+    except HTTPError as exc:
+        if exc.code == 404:
+            raise ValueError(f"Instagram username does not exist: {username}") from exc
+        return None
+    except URLError:
+        return None
+
+    match = re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"', page)
+    if not match:
+        return None
+
+    return html.unescape(match.group(1))
 
 
 def _file_extension_from_url(url: str) -> str:
@@ -194,27 +226,36 @@ def _fetch_pfp(username: str) -> dict:
 
         try:
             profile = Profile.from_username(loader.context, normalized)
+            profile_pic_url = profile.profile_pic_url
+            source = "instaloader"
         except ProfileNotExistsException as exc:
             raise ValueError(f"Instagram username does not exist: {normalized}") from exc
         except TooManyRequestsException as exc:
             _set_rate_limit_cooldown(time.time(), RATE_LIMIT_COOLDOWN_SECONDS)
-            raise InstagramRateLimitError(
-                "Instagram rate limit reached (429). Please retry after some time.",
-                retry_after_seconds=RATE_LIMIT_COOLDOWN_SECONDS,
-            ) from exc
-        except ConnectionException as exc:
-            if "429" in str(exc):
-                _set_rate_limit_cooldown(time.time(), RATE_LIMIT_COOLDOWN_SECONDS)
+            profile_pic_url = _fetch_public_profile_pic_url(normalized)
+            if not profile_pic_url:
                 raise InstagramRateLimitError(
                     "Instagram rate limit reached (429). Please retry after some time.",
                     retry_after_seconds=RATE_LIMIT_COOLDOWN_SECONDS,
                 ) from exc
-            raise RuntimeError("Instagram connection failed while fetching profile.") from exc
+            source = "public_html_fallback"
+        except ConnectionException as exc:
+            if "429" in str(exc):
+                _set_rate_limit_cooldown(time.time(), RATE_LIMIT_COOLDOWN_SECONDS)
+                profile_pic_url = _fetch_public_profile_pic_url(normalized)
+                if not profile_pic_url:
+                    raise InstagramRateLimitError(
+                        "Instagram rate limit reached (429). Please retry after some time.",
+                        retry_after_seconds=RATE_LIMIT_COOLDOWN_SECONDS,
+                    ) from exc
+                source = "public_html_fallback"
+            else:
+                raise RuntimeError("Instagram connection failed while fetching profile.") from exc
 
-        ext = _file_extension_from_url(profile.profile_pic_url)
+        ext = _file_extension_from_url(profile_pic_url)
         local_path = IMAGE_CACHE_DIR / f"{normalized}{ext}"
         try:
-            _download_image(profile.profile_pic_url, local_path)
+            _download_image(profile_pic_url, local_path)
         except URLError as exc:
             raise RuntimeError("Failed to download profile image from Instagram.") from exc
 
@@ -233,6 +274,7 @@ def _fetch_pfp(username: str) -> dict:
         "username": normalized,
         "local_path": str(local_path),
         "content_type": content_type,
+        "source": source,
         "cached": False,
         "expires_at": _iso_utc(expires),
     }
@@ -274,6 +316,8 @@ def get_profile_pic(username: str):
         response: Response = send_file(file_path, mimetype=payload["content_type"])
         response.headers["X-Cache"] = "HIT" if payload["cached"] else "MISS"
         response.headers["X-Cache-Expires-At"] = payload["expires_at"]
+        if "source" in payload:
+            response.headers["X-Source"] = payload["source"]
         return response
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 404
