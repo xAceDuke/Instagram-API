@@ -63,7 +63,8 @@ def _prepare_session_file_from_b64() -> str | None:
     target = Path(target_path)
     target.parent.mkdir(parents=True, exist_ok=True)
 
-    decoded = base64.b64decode(session_b64)
+    normalized_b64 = "".join(session_b64.split())
+    decoded = base64.b64decode(normalized_b64)
     target.write_bytes(decoded)
     return str(target)
 
@@ -76,16 +77,21 @@ def _load_instaloader_session(loader: Instaloader) -> None:
         raise InstagramSessionError("Missing INSTAGRAM_LOGIN_USER environment variable.")
 
     if not session_file:
+        session_file = "/tmp/instagram.session"
+
+    session_path = Path(session_file)
+    if not session_path.exists():
         fallback = _prepare_session_file_from_b64()
         if fallback:
             session_file = fallback
+            session_path = Path(session_file)
 
     if not session_file:
         raise InstagramSessionError(
             "Missing INSTAGRAM_SESSION_FILE (or INSTAGRAM_SESSION_FILE_B64) environment variable."
         )
 
-    if not Path(session_file).exists():
+    if not session_path.exists():
         raise InstagramSessionError(f"Session file not found: {session_file}")
 
     try:
