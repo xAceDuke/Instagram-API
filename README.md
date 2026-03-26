@@ -110,6 +110,8 @@ Windows PowerShell:
 - `INSTAGRAM_SESSION_FILE_B64` = full content of `session.b64`
 - `INSTAGRAM_SESSION_FILE` = `/tmp/instagram.session`
 - `IMAGE_CACHE_DIR` = `/tmp/instagram-pfp-cache`
+- `INSTAGRAM_RATE_LIMIT_COOLDOWN_SECONDS` = `1800` (optional, cooldown after 429)
+- `INSTAGRAM_MAX_RATE_SLEEP_SECONDS` = `1` (optional, avoid long blocking waits)
 
 4. Save changes.
 5. Click **Manual Deploy** → **Deploy latest commit** (or restart service).
@@ -181,3 +183,9 @@ Fix checklist:
 - `X-Cache: MISS` = fetched from Instagram and saved locally.
 - `X-Cache: HIT` = served from local cached file.
 - Cache is per running instance and expires after 3 hours.
+
+### 429 handling in this API
+
+- The API fails fast on Instagram rate limits instead of waiting for long retries.
+- Response is `429` with `Retry-After` header and `retry_after_seconds` in JSON.
+- A temporary cooldown is applied to protect the service from repeated 429 loops.
